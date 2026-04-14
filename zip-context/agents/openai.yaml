@@ -1,0 +1,4 @@
+interface:
+  display_name: "Zip Context"
+  short_description: "Package clean project context as zip"
+  default_prompt: "Use $zip-context to create or refresh a clean project-context zip archive for the current project."
