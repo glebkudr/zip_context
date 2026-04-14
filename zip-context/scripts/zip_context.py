@@ -229,6 +229,14 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Archive path for the `zip` command.",
     )
+    parser.add_argument(
+        "--paths-file",
+        type=Path,
+        help=(
+            "Optional newline-delimited file with repo-relative or absolute paths to package. "
+            "Useful when the agent already identified files related to a specific task or subsystem."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -248,16 +256,42 @@ def main() -> int:
 
     output_path = args.output.resolve() if args.output else default_output_path(setup.root)
     extra_ignored_paths = [Path(IGNORE_FILE_NAME)]
+    if args.paths_file is not None:
+        try:
+            extra_ignored_paths.append(args.paths_file.resolve().relative_to(setup.root))
+        except ValueError:
+            pass
     try:
         extra_ignored_paths.append(output_path.relative_to(setup.root))
     except ValueError:
         pass
 
-    selection = select_project_files(
-        setup=setup,
-        ignore_patterns=ignore_state.generated_patterns + ignore_state.extra_patterns,
-        extra_ignored_paths=extra_ignored_paths,
-    )
+    if args.paths_file is not None:
+        try:
+            explicit_candidates, explicit_missing_paths = load_explicit_candidate_paths(
+                root=setup.root,
+                paths_file=args.paths_file.resolve(),
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            sys.stderr.write(f"{exc}\n")
+            return 1
+
+        print(f"selection mode: focused ({args.paths_file.resolve()})")
+        selection = select_project_files(
+            setup=setup,
+            ignore_patterns=ignore_state.generated_patterns + ignore_state.extra_patterns,
+            extra_ignored_paths=extra_ignored_paths,
+            candidate_paths=explicit_candidates,
+            apply_ignore_patterns=False,
+            initial_missing_paths=explicit_missing_paths,
+        )
+    else:
+        print("selection mode: full project")
+        selection = select_project_files(
+            setup=setup,
+            ignore_patterns=ignore_state.generated_patterns + ignore_state.extra_patterns,
+            extra_ignored_paths=extra_ignored_paths,
+        )
     if not selection.relative_paths:
         sys.stderr.write("no files selected for the zip-context archive\n")
         return 1
@@ -536,6 +570,82 @@ def unique_preserve_order(values: list[str]) -> list[str]:
     return result
 
 
+def load_explicit_candidate_paths(root: Path, paths_file: Path) -> tuple[list[Path], int]:
+    if not paths_file.is_file():
+        raise FileNotFoundError(f"paths file not found: {paths_file}")
+
+    relative_paths: list[Path] = []
+    seen: set[str] = set()
+    missing_paths = 0
+
+    for raw_line in paths_file.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        target = resolve_manifest_target(root=root, raw_path=line)
+        if target is None:
+            missing_paths += 1
+            continue
+
+        for relative_path in expand_manifest_target(root=root, target=target):
+            path_string = relative_path.as_posix()
+            if path_string in seen:
+                continue
+            seen.add(path_string)
+            relative_paths.append(relative_path)
+
+    return relative_paths, missing_paths
+
+
+def resolve_manifest_target(root: Path, raw_path: str) -> Path | None:
+    candidate = Path(raw_path)
+    absolute_target = candidate if candidate.is_absolute() else (root / candidate)
+    absolute_target = absolute_target.resolve()
+
+    try:
+        absolute_target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(
+            f"paths file entry points outside project root: {raw_path}"
+        ) from exc
+
+    if not absolute_target.exists():
+        return None
+
+    return absolute_target
+
+
+def expand_manifest_target(root: Path, target: Path) -> list[Path]:
+    if target.is_file():
+        return [target.relative_to(root)]
+
+    if not target.is_dir():
+        return []
+
+    relative_paths: list[Path] = []
+    for child in sorted(target.rglob("*")):
+        if child.is_file():
+            relative_paths.append(child.relative_to(root))
+    return relative_paths
+
+
+def should_exclude_secret_path(relative_path: Path) -> bool:
+    name = relative_path.name.lower()
+    if name.startswith(".env") and name not in {
+        ".env.example",
+        ".env.sample",
+        ".env.template",
+        ".env.dist",
+    }:
+        return True
+    if name in {"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}:
+        return True
+    if relative_path.suffix.lower() in {".pem", ".key", ".p12", ".pfx"}:
+        return True
+    return False
+
+
 def discover_binary_asset_subtrees(root: Path) -> list[str]:
     candidates: list[Path] = []
     seen_candidates: set[Path] = set()
@@ -652,17 +762,24 @@ def select_project_files(
     setup: ProjectSetup,
     ignore_patterns: list[str],
     extra_ignored_paths: list[Path] | None = None,
+    candidate_paths: list[Path] | None = None,
+    apply_ignore_patterns: bool = True,
+    initial_missing_paths: int = 0,
 ) -> SelectionResult:
-    candidates = list_candidate_files(setup, ignore_patterns)
+    candidates = candidate_paths if candidate_paths is not None else list_candidate_files(setup, ignore_patterns)
     ignored_exact = {path.as_posix() for path in extra_ignored_paths or []}
     relative_paths: list[Path] = []
     ignored_paths = 0
     binary_paths = 0
-    missing_paths = 0
+    missing_paths = initial_missing_paths
+    seen: set[str] = set()
 
     for relative_path in candidates:
         path_string = relative_path.as_posix()
         absolute_path = setup.root / relative_path
+        if path_string in seen:
+            continue
+        seen.add(path_string)
 
         if path_string in ignored_exact:
             ignored_paths += 1
@@ -670,7 +787,10 @@ def select_project_files(
         if not absolute_path.is_file():
             missing_paths += 1
             continue
-        if should_ignore_path(path_string, ignore_patterns):
+        if should_exclude_secret_path(relative_path):
+            ignored_paths += 1
+            continue
+        if apply_ignore_patterns and should_ignore_path(path_string, ignore_patterns):
             ignored_paths += 1
             continue
         if is_probably_binary(absolute_path):
@@ -683,7 +803,7 @@ def select_project_files(
     return SelectionResult(
         relative_paths=relative_paths,
         stats=SelectionStats(
-            candidate_paths=len(candidates),
+            candidate_paths=len(seen) + initial_missing_paths,
             included_paths=len(relative_paths),
             ignored_paths=ignored_paths,
             binary_paths=binary_paths,

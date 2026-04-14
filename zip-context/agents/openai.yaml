@@ -1,4 +1,4 @@
 interface:
   display_name: "Zip Context"
   short_description: "Package clean project context as zip"
-  default_prompt: "Use $zip-context to create or refresh a clean project-context zip archive for the current project."
+  default_prompt: "Use $zip-context to create or refresh a clean project-context zip archive. Package the full project by default, but if the user asks for a subsystem or task scope, inspect the repo first, build a focused paths manifest, and archive only that scope."
